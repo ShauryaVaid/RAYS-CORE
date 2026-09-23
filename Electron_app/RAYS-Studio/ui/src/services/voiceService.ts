@@ -184,6 +184,15 @@ export class VoiceEngine {
   private accumulatedTranscript = "";
   private stopResolver: ((blob: Blob | null) => void) | null = null;
 
+  // Backend TTS (Edge TTS / OpenAI / ElevenLabs / pyttsx3 / OS)
+  // 'auto' = try backend first, fallback to browser speechSynthesis
+  private ttsProvider: string = "auto";
+  private ttsVoice: string | null = null;
+  private ttsSpeed: number = 1.0;
+  private backendTtsAvailable: boolean | null = null; // null = not yet probed
+  private currentAudio: HTMLAudioElement | null = null;
+
+
   public state: VoiceState = "idle";
   public onStateChange?: (state: VoiceState) => void;
   public onLevelChange?: VoiceLevelCallback;
@@ -955,10 +964,97 @@ export class VoiceEngine {
     return this.ttsEnabled;
   }
 
-  /** Speak text aloud via Web Speech Synthesis */
-  public speak(text: string) {
-    if (typeof window === "undefined" || !window.speechSynthesis) return;
+  /** Configure backend TTS provider ('auto'|'edge'|'openai'|'elevenlabs'|'pyttsx3'|'system'|'browser') */
+  public setTtsProvider(provider: string) {
+    this.ttsProvider = provider;
+    this.backendTtsAvailable = null; // reset probe cache on provider change
+  }
 
+  /** Set Edge TTS voice name (e.g. 'en-US-AriaNeural', 'en-GB-SoniaNeural') */
+  public setTtsVoice(voice: string | null) {
+    this.ttsVoice = voice;
+  }
+
+  /** Set TTS speed (0.5–2.0, 1.0 = normal) */
+  public setTtsSpeed(speed: number) {
+    this.ttsSpeed = Math.max(0.5, Math.min(2.0, speed));
+  }
+
+  public get ttsCurrentProvider(): string { return this.ttsProvider; }
+  public get ttsCurrentVoice(): string | null { return this.ttsVoice; }
+
+  /**
+   * Backend TTS via /api/voice/tts (Edge TTS / OpenAI / ElevenLabs / pyttsx3 / OS)
+   * Returns base64 audio that plays via HTMLAudioElement — much better quality than Web Speech API.
+   */
+  private async speakViaBackend(text: string): Promise<boolean> {
+    if (this.ttsProvider === "browser") return false;
+
+    try {
+      const body: Record<string, unknown> = { text, speed: this.ttsSpeed };
+      if (this.ttsProvider !== "auto") body.provider = this.ttsProvider;
+      if (this.ttsVoice) body.voice = this.ttsVoice;
+
+      const res = await fetch("/api/voice/tts", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout ? AbortSignal.timeout(32000) : undefined,
+      });
+
+      if (!res.ok) return false;
+      const data = await res.json();
+      if (!data?.success || !data.audioBase64) return false;
+
+      // Mark backend as available
+      this.backendTtsAvailable = true;
+
+      // Play via HTMLAudioElement (works in all browsers, no voice-list quirks)
+      return new Promise<boolean>((resolve) => {
+        const audio = new Audio(`data:${data.mimeType || "audio/mpeg"};base64,${data.audioBase64}`);
+        this.currentAudio = audio;
+
+        audio.onended = () => {
+          this.currentAudio = null;
+          resolve(true);
+          this._onTtsDone();
+        };
+        audio.onerror = () => {
+          this.currentAudio = null;
+          resolve(false); // fallback to browser TTS
+        };
+
+        audio.play().catch(() => {
+          this.currentAudio = null;
+          resolve(false);
+        });
+      });
+    } catch {
+      this.backendTtsAvailable = false;
+      return false;
+    }
+  }
+
+  /** Called when TTS audio finishes (backend or browser) — re-arms continuous mode */
+  private _onTtsDone() {
+    this.isSpeaking = false;
+    this.currentUtterance = null;
+    if (this.ttsQueue.length > 0) {
+      this.drainTtsQueue();
+    } else if (this.isContinuousMode) {
+      // Auto re-arm: immediately restart listening after TTS finishes (Hermes behavior)
+      void this.start(true);
+    } else {
+      this.setState("idle");
+    }
+  }
+
+  /**
+   * Speak text aloud.
+   * Priority: Backend TTS (Edge/OpenAI/ElevenLabs/pyttsx3) → Web Speech Synthesis fallback.
+   * In continuous mode, re-arms listening automatically when done (Hermes style).
+   */
+  public speak(text: string) {
     const clean = this.sanitizeForSpeech(text);
     if (!clean) return;
 
@@ -969,28 +1065,40 @@ export class VoiceEngine {
   }
 
   private drainTtsQueue() {
-    if (typeof window === "undefined" || !window.speechSynthesis) return;
-
     if (this.ttsQueue.length === 0) {
-      this.isSpeaking = false;
-      this.currentUtterance = null;
-      // Hermes auto re-arm: When TTS speech finishes in continuous mode, immediately restart listening for user!
-      if (this.isContinuousMode) {
-        void this.start(true);
-      } else {
-        this.setState("idle");
-      }
+      this._onTtsDone();
       return;
     }
 
     const nextText = this.ttsQueue.shift();
-    if (!nextText) return;
+    if (!nextText) { this.drainTtsQueue(); return; }
 
     this.isSpeaking = true;
     this.setState("speaking");
 
-    const utterance = new SpeechSynthesisUtterance(nextText);
-    utterance.rate = 1.05;
+    // Try backend TTS first (unless provider is explicitly 'browser')
+    if (this.ttsProvider !== "browser" && typeof window !== "undefined" && window.fetch) {
+      void this.speakViaBackend(nextText).then((didPlay) => {
+        if (!didPlay) {
+          // Backend unavailable — fall through to browser Web Speech API
+          this._speakViaBrowser(nextText);
+        }
+        // If didPlay is true, _onTtsDone() was already called from audio.onended
+      });
+    } else {
+      this._speakViaBrowser(nextText);
+    }
+  }
+
+  /** Browser Web Speech Synthesis fallback (always works in Chrome/Edge, limited on Firefox/Linux) */
+  private _speakViaBrowser(text: string) {
+    if (typeof window === "undefined" || !window.speechSynthesis) {
+      this._onTtsDone();
+      return;
+    }
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = this.ttsSpeed;
     utterance.pitch = 1.0;
 
     const voices = window.speechSynthesis.getVoices();
@@ -1015,12 +1123,11 @@ export class VoiceEngine {
 
     utterance.onend = () => {
       this.currentUtterance = null;
-      this.drainTtsQueue();
+      this._onTtsDone();
     };
-
     utterance.onerror = () => {
       this.currentUtterance = null;
-      this.drainTtsQueue();
+      this._onTtsDone();
     };
 
     this.currentUtterance = utterance;
@@ -1029,9 +1136,21 @@ export class VoiceEngine {
 
   public stopSpeech() {
     this.ttsQueue = [];
+
+    // Stop HTMLAudioElement (backend TTS)
+    if (this.currentAudio) {
+      try {
+        this.currentAudio.pause();
+        this.currentAudio.src = "";
+      } catch {}
+      this.currentAudio = null;
+    }
+
+    // Stop Web Speech Synthesis
     if (typeof window !== "undefined" && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+
     this.isSpeaking = false;
     this.currentUtterance = null;
     if (this.state === "speaking") {
@@ -1052,3 +1171,4 @@ export class VoiceEngine {
 }
 
 export const voiceEngine = new VoiceEngine();
+

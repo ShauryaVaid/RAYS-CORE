@@ -550,7 +550,155 @@ print("JSON_START" + json.dumps(res) + "JSON_END")
             }
           });
         });
+
+        // ── TTS endpoint: POST /api/voice/tts ────────────────────────────────
+        // Body: { text, provider?, voice?, speed? }
+        // Returns: { success, audioBase64, mimeType, provider, error }
+        server.middlewares.use("/api/voice/tts", (req, res) => {
+          if (req.method !== "POST") {
+            res.statusCode = 405;
+            res.end("Method not allowed");
+            return;
+          }
+
+          let body = "";
+          req.on("data", (chunk) => { body += chunk; });
+          req.on("end", async () => {
+            try {
+              const { text, provider, voice, speed } = JSON.parse(body || "{}");
+              if (!text || !text.trim()) {
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ success: false, audioBase64: "", error: "No text provided" }));
+                return;
+              }
+
+              const isWin = process.platform === "win32";
+              const srcPath = path.join(cliRoot, "src");
+              const pyPathSep = isWin ? ";" : ":";
+              const extraPaths = isWin
+                ? []
+                : process.platform === "darwin"
+                  ? ["/opt/homebrew/bin", "/opt/anaconda3/bin", "/usr/local/bin", "/usr/bin"]
+                  : ["/usr/bin", "/usr/local/bin"];
+              const envPath = [...extraPaths, process.env.PATH || ""].filter(Boolean).join(isWin ? ";" : ":");
+
+              let selectedPython = isWin ? "python" : "python3";
+              for (const c of [process.env.PYTHON || "", process.env.PYTHON3 || "", ...(isWin ? ["python"] : ["python3", "python"])].filter(Boolean)) {
+                if (c.includes("/") || c.includes("\\") || c.includes(".exe")) {
+                  if (await fs.stat(c).then(() => true).catch(() => false)) { selectedPython = c; break; }
+                } else { selectedPython = c; break; }
+              }
+
+              const ttsScript = `
+import sys, json
+sys.path.insert(0, ${JSON.stringify(srcPath)})
+try:
+    raw = sys.stdin.buffer.read().decode("utf-8", errors="ignore").strip()
+    params = json.loads(raw) if raw else {}
+    from rays_core.voice_tts import synthesize_speech
+    res = synthesize_speech(
+        params.get("text", ""),
+        provider=params.get("provider"),
+        voice=params.get("voice"),
+        speed=float(params.get("speed", 1.0)),
+    )
+except Exception as e:
+    import traceback
+    res = {"success": False, "audioBase64": "", "mimeType": "audio/mpeg", "provider": "", "error": str(e), "traceback": traceback.format_exc()}
+print("JSON_START" + json.dumps(res) + "JSON_END")
+`;
+
+              const proc = spawn(selectedPython, ["-c", ttsScript], {
+                env: { ...process.env, PATH: envPath, PYTHONPATH: `${srcPath}${pyPathSep}${process.env.PYTHONPATH || ""}`, PYTHONUTF8: "1" },
+                cwd: os.homedir(),
+              });
+
+              let output = "";
+              proc.stdout.on("data", (d) => { output += d.toString("utf8"); });
+              proc.stderr.on("data", (d) => { console.warn("[Vite TTS]", d.toString("utf8").trim()); });
+
+              let closed = false;
+              const timer = setTimeout(() => {
+                if (!closed) {
+                  closed = true;
+                  try { proc.kill(); } catch {}
+                  if (!res.writableEnded) {
+                    res.setHeader("content-type", "application/json");
+                    res.end(JSON.stringify({ success: false, audioBase64: "", error: "TTS timeout (30s)" }));
+                  }
+                }
+              }, 30000);
+
+              proc.stdin.on("error", () => {});
+              proc.on("error", (err) => {
+                if (closed) return; closed = true; clearTimeout(timer);
+                if (!res.writableEnded) {
+                  res.setHeader("content-type", "application/json");
+                  res.end(JSON.stringify({ success: false, audioBase64: "", error: `Python error: ${String(err)}` }));
+                }
+              });
+              proc.on("close", () => {
+                if (closed) return; closed = true; clearTimeout(timer);
+                const match = output.match(/JSON_START([\s\S]*?)JSON_END/);
+                res.setHeader("content-type", "application/json");
+                if (match) { try { res.end(match[1]); return; } catch {} }
+                res.end(JSON.stringify({ success: false, audioBase64: "", error: output || "TTS failed" }));
+              });
+
+              try {
+                proc.stdin.write(JSON.stringify({ text, provider, voice, speed }));
+                proc.stdin.end();
+              } catch { /* ignore EPIPE */ }
+            } catch (err: any) {
+              if (!res.writableEnded) {
+                res.statusCode = 500;
+                res.setHeader("content-type", "application/json");
+                res.end(JSON.stringify({ success: false, audioBase64: "", error: err.message }));
+              }
+            }
+          });
+        });
+
+        // ── Voice list endpoint: GET /api/voice/voices ───────────────────────
+        // Returns list of available Edge TTS voices
+        server.middlewares.use("/api/voice/voices", (req, res) => {
+          if (req.method !== "GET") { res.statusCode = 405; res.end(); return; }
+          const isWin = process.platform === "win32";
+          const srcPath = path.join(cliRoot, "src");
+          const pyPathSep = isWin ? ";" : ":";
+          const extraPaths = isWin ? [] : process.platform === "darwin"
+            ? ["/opt/homebrew/bin", "/usr/local/bin"] : ["/usr/bin", "/usr/local/bin"];
+          const envPath = [...extraPaths, process.env.PATH || ""].filter(Boolean).join(isWin ? ";" : ":");
+          const selectedPython = isWin ? "python" : "python3";
+
+          const voiceScript = `
+import sys, json
+sys.path.insert(0, ${JSON.stringify(srcPath)})
+try:
+    from rays_core.voice_tts import list_edge_voices
+    res = list_edge_voices()
+except Exception as e:
+    res = {"success": False, "voices": [], "error": str(e)}
+print("JSON_START" + json.dumps(res) + "JSON_END")
+`;
+          let output = "";
+          const proc = spawn(selectedPython, ["-c", voiceScript], {
+            env: { ...process.env, PATH: envPath, PYTHONPATH: `${srcPath}${pyPathSep}${process.env.PYTHONPATH || ""}`, PYTHONUTF8: "1" },
+          });
+          proc.stdout.on("data", (d) => { output += d.toString("utf8"); });
+          proc.stderr.on("data", (d) => { console.warn("[Vite Voices]", d.toString("utf8").trim()); });
+          proc.on("close", () => {
+            const match = output.match(/JSON_START([\s\S]*?)JSON_END/);
+            res.setHeader("content-type", "application/json");
+            res.end(match ? match[1] : JSON.stringify({ success: false, voices: [], error: "Failed" }));
+          });
+          proc.on("error", () => {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ success: false, voices: [], error: "Python not found" }));
+          });
+        });
       },
+
     },
   ],
   resolve: {
