@@ -28,8 +28,8 @@ contextBridge.exposeInMainWorld("raysDesktop", {
     ipcRenderer.invoke("rays:route-general-prompt", { prompt, workspaceRoot }),
   listConnectedAgents: (workspaceRoot) =>
     ipcRenderer.invoke("rays:list-connected-agents", { workspaceRoot }),
-  transcribeAudio: (audioBase64, mimeType) =>
-    ipcRenderer.invoke("rays:transcribe-audio", { audioBase64, mimeType }),
+  transcribeAudio: (audioBase64, mimeType, provider) =>
+    ipcRenderer.invoke("rays:transcribe-audio", { audioBase64, mimeType, provider }),
   synthesizeSpeech: (text, provider, voice, speed) =>
     ipcRenderer.invoke("rays:synthesize-speech", { text, provider, voice, speed }),
   listVoices: () => ipcRenderer.invoke("rays:list-voices"),

@@ -257,13 +257,11 @@ def _try_google_sr(audio_path: str) -> Optional[str]:
         return None
 
 
-def transcribe_audio_file(file_path: str) -> Dict[str, Any]:
+def transcribe_audio_file(file_path: str, preferred_provider: Optional[str] = None) -> Dict[str, Any]:
     """
-    Transcribe an audio file using available providers (waterfall order):
-    1. faster-whisper (local, free)
-    2. Groq Whisper (cloud, fast)
-    3. OpenAI Whisper (cloud, reliable)
-    4. Google STT via SpeechRecognition (free fallback)
+    Transcribe an audio file using available providers.
+    If preferred_provider is specified (faster-whisper, groq, openai, google), tries that first.
+    Otherwise uses waterfall: faster-whisper -> groq -> openai -> google.
     """
     if not os.path.exists(file_path):
         return {"success": False, "transcript": "", "error": "Audio file not found"}
@@ -283,46 +281,53 @@ def transcribe_audio_file(file_path: str) -> Dict[str, Any]:
             wav_path = temp_wav
         else:
             _log("WAV conversion failed — trying with original file")
-            # If it's already a WAV, use it directly
             if file_path.lower().endswith(".wav"):
                 wav_path = file_path
             else:
-                wav_path = file_path  # last resort
+                wav_path = file_path
 
-        # Waterfall: try each provider in order
+        # Build order based on preference
+        pref = (preferred_provider or "").lower().strip()
+        all_providers = ["faster-whisper", "groq", "openai", "google"]
+        if pref in all_providers:
+            provider_order = [pref] + [p for p in all_providers if p != pref]
+        else:
+            provider_order = all_providers
+
         providers_tried = []
 
-        # 1. faster-whisper (local, no API key)
-        providers_tried.append("faster-whisper")
-        result = _try_faster_whisper(wav_path)
-        if result is not None:
-            return {"success": True, "transcript": result, "error": "", "provider": "faster-whisper"}
+        for p in provider_order:
+            if p == "faster-whisper":
+                providers_tried.append("faster-whisper")
+                result = _try_faster_whisper(wav_path)
+                if result is not None:
+                    return {"success": True, "transcript": result, "error": "", "provider": "faster-whisper"}
 
-        # 2. Groq Whisper (if API key present)
-        if os.getenv("GROQ_API_KEY") or os.getenv("GROQ_KEY"):
-            providers_tried.append("groq")
-            result = _try_groq(wav_path)
-            if result is not None:
-                if result == "":
-                    return {"success": True, "transcript": "", "error": "No speech detected", "provider": "groq"}
-                return {"success": True, "transcript": result, "error": "", "provider": "groq"}
+            elif p == "groq":
+                if os.getenv("GROQ_API_KEY") or os.getenv("GROQ_KEY"):
+                    providers_tried.append("groq")
+                    result = _try_groq(wav_path)
+                    if result is not None:
+                        if result == "":
+                            return {"success": True, "transcript": "", "error": "No speech detected", "provider": "groq"}
+                        return {"success": True, "transcript": result, "error": "", "provider": "groq"}
 
-        # 3. OpenAI Whisper (if API key present)
-        if os.getenv("OPENAI_API_KEY"):
-            providers_tried.append("openai")
-            result = _try_openai(wav_path)
-            if result is not None:
-                if result == "":
-                    return {"success": True, "transcript": "", "error": "No speech detected", "provider": "openai"}
-                return {"success": True, "transcript": result, "error": "", "provider": "openai"}
+            elif p == "openai":
+                if os.getenv("OPENAI_API_KEY"):
+                    providers_tried.append("openai")
+                    result = _try_openai(wav_path)
+                    if result is not None:
+                        if result == "":
+                            return {"success": True, "transcript": "", "error": "No speech detected", "provider": "openai"}
+                        return {"success": True, "transcript": result, "error": "", "provider": "openai"}
 
-        # 4. Google STT via SpeechRecognition (always-available free fallback)
-        providers_tried.append("google")
-        result = _try_google_sr(wav_path)
-        if result is not None:
-            if result == "":
-                return {"success": True, "transcript": "", "error": "No speech detected", "provider": "google"}
-            return {"success": True, "transcript": result, "error": "", "provider": "google"}
+            elif p == "google":
+                providers_tried.append("google")
+                result = _try_google_sr(wav_path)
+                if result is not None:
+                    if result == "":
+                        return {"success": True, "transcript": "", "error": "No speech detected", "provider": "google"}
+                    return {"success": True, "transcript": result, "error": "", "provider": "google"}
 
         _log(f"All STT providers failed. Tried: {', '.join(providers_tried)}")
         return {
@@ -341,15 +346,13 @@ def transcribe_audio_file(file_path: str) -> Dict[str, Any]:
                 pass
 
 
-def transcribe_audio_base64(data_b64: str, mime_type: str = "audio/webm") -> Dict[str, Any]:
-    """Transcribe base64-encoded audio data."""
+def transcribe_audio_base64(data_b64: str, mime_type: str = "audio/webm", provider: Optional[str] = None) -> Dict[str, Any]:
+    """Transcribe base64-encoded audio data with optional preferred provider."""
     temp_path = None
     try:
-        # Strip data URL prefix if present (e.g. data:audio/webm;codecs=opus;base64,...)
         if "base64," in data_b64:
             data_b64 = data_b64.split("base64,")[1]
 
-        # Clean whitespace that can appear in data URLs
         data_b64 = data_b64.strip().replace("\n", "").replace("\r", "")
 
         raw_bytes = base64.b64decode(data_b64)
@@ -362,8 +365,8 @@ def transcribe_audio_base64(data_b64: str, mime_type: str = "audio/webm") -> Dic
             f.write(raw_bytes)
             temp_path = f.name
 
-        _log(f"Received {len(raw_bytes)} bytes of {mime_type} audio — transcribing...")
-        return transcribe_audio_file(temp_path)
+        _log(f"Received {len(raw_bytes)} bytes of {mime_type} audio — transcribing (preferred: {provider or 'auto'})...")
+        return transcribe_audio_file(temp_path, preferred_provider=provider)
 
     except Exception as e:
         _log(f"transcribe_audio_base64 exception: {e}")
@@ -376,14 +379,31 @@ def transcribe_audio_base64(data_b64: str, mime_type: str = "audio/webm") -> Dic
                 pass
 
 
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         arg = sys.argv[1]
         mtype = sys.argv[2] if len(sys.argv) > 2 else "audio/webm"
+        provider = sys.argv[3] if len(sys.argv) > 3 else None
         if os.path.exists(arg):
-            res = transcribe_audio_file(arg)
+            res = transcribe_audio_file(arg, preferred_provider=provider)
         else:
-            res = transcribe_audio_base64(arg, mtype)
+            res = transcribe_audio_base64(arg, mtype, provider=provider)
         print("JSON_START" + json.dumps(res) + "JSON_END")
     else:
-        print("Usage: python voice_transcriber.py <file_path_or_base64> [mime_type]")
+        # Read from stdin (can be raw base64 or json)
+        raw = sys.stdin.read().strip()
+        if raw:
+            try:
+                params = json.loads(raw)
+                res = transcribe_audio_base64(
+                    params.get("audioBase64", ""),
+                    params.get("mimeType", "audio/webm"),
+                    provider=params.get("provider"),
+                )
+            except Exception:
+                res = transcribe_audio_base64(raw, "audio/webm")
+            print("JSON_START" + json.dumps(res) + "JSON_END")
+        else:
+            print("Usage: python voice_transcriber.py <file_path_or_base64> [mime_type] [provider]")
+

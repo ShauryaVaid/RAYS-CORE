@@ -18,6 +18,12 @@
  *    - On "stop" / "stop rays" -> exits Continuous Mode, remains passively listening for "Hey RAYS"!
  */
 
+import {
+  loadVoiceSettings,
+  saveVoiceSettings,
+  type VoiceSettings,
+} from "./voiceSettingsStorage";
+
 export interface VoiceLevelCallback {
   (level: number): void;
 }
@@ -192,6 +198,13 @@ export class VoiceEngine {
   private backendTtsAvailable: boolean | null = null; // null = not yet probed
   private currentAudio: HTMLAudioElement | null = null;
 
+  // STT Provider ('auto' | 'faster-whisper' | 'groq' | 'openai' | 'google')
+  private sttProvider: string = "auto";
+
+  // Hermes-style Barge-in interruption
+  private bargeInEnabled: boolean = true;
+  private bargeInMonitorActive = false;
+  private bargeInAnimId: number | null = null;
 
   public state: VoiceState = "idle";
   public onStateChange?: (state: VoiceState) => void;
@@ -235,6 +248,7 @@ export class VoiceEngine {
 
   constructor() {
     this.initRecognition();
+    this.loadConfiguredSettings();
   }
 
   private setState(next: VoiceState) {
@@ -595,7 +609,11 @@ export class VoiceEngine {
 
         // 1. Electron App Mode
         if ((window as any).raysDesktop?.transcribeAudio) {
-          const res = await (window as any).raysDesktop.transcribeAudio(base64, mimeType);
+          const res = await (window as any).raysDesktop.transcribeAudio(
+            base64,
+            mimeType,
+            this.sttProvider !== "auto" ? this.sttProvider : undefined
+          );
           if (res && res.success && res.transcript) {
             return res.transcript.trim();
           }
@@ -605,7 +623,11 @@ export class VoiceEngine {
         const res = await fetch("/api/voice/transcribe", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ audioBase64: base64, mimeType }),
+          body: JSON.stringify({
+            audioBase64: base64,
+            mimeType,
+            provider: this.sttProvider !== "auto" ? this.sttProvider : undefined,
+          }),
         });
         if (res.ok) {
           const data = await res.json();
@@ -965,23 +987,148 @@ export class VoiceEngine {
   }
 
   /** Configure backend TTS provider ('auto'|'edge'|'openai'|'elevenlabs'|'pyttsx3'|'system'|'browser') */
+  public loadConfiguredSettings() {
+    const s = loadVoiceSettings();
+    this.ttsProvider = s.ttsProvider;
+    this.ttsVoice = s.ttsVoice;
+    this.ttsSpeed = s.ttsSpeed;
+    this.sttProvider = s.sttProvider;
+    this.ttsEnabled = s.autoSpeakReplies;
+    this.bargeInEnabled = s.bargeInEnabled;
+    this.silenceMs = s.silenceTimeoutMs;
+    if (s.wakeWordEnabled) {
+      void this.setPassiveWakeListening(true);
+    }
+  }
+
+  public applyVoiceSettings(s: VoiceSettings) {
+    this.ttsProvider = s.ttsProvider;
+    this.ttsVoice = s.ttsVoice;
+    this.ttsSpeed = s.ttsSpeed;
+    this.sttProvider = s.sttProvider;
+    this.ttsEnabled = s.autoSpeakReplies;
+    this.bargeInEnabled = s.bargeInEnabled;
+    this.silenceMs = s.silenceTimeoutMs;
+    this.backendTtsAvailable = null;
+    saveVoiceSettings(s);
+  }
+
+  public get currentSettings(): VoiceSettings {
+    return {
+      ttsProvider: this.ttsProvider as any,
+      ttsVoice: this.ttsVoice || "en-US-AriaNeural",
+      ttsSpeed: this.ttsSpeed,
+      sttProvider: this.sttProvider as any,
+      autoSpeakReplies: this.ttsEnabled,
+      wakeWordEnabled: this.isWakeListening,
+      bargeInEnabled: this.bargeInEnabled,
+      silenceTimeoutMs: this.silenceMs,
+    };
+  }
+
+  public setSttProvider(provider: string) {
+    this.sttProvider = provider;
+    saveVoiceSettings({ sttProvider: provider as any });
+  }
+
+  public get sttCurrentProvider(): string {
+    return this.sttProvider;
+  }
+
+  public setBargeInEnabled(enabled: boolean) {
+    this.bargeInEnabled = enabled;
+    saveVoiceSettings({ bargeInEnabled: enabled });
+  }
+
+  public get isBargeInEnabled(): boolean {
+    return this.bargeInEnabled;
+  }
+
+  /** Quick voice audition test */
+  public async testVoice(sampleText = "Hello! This is RAYS with neural voice synthesis."): Promise<boolean> {
+    const clean = this.sanitizeForSpeech(sampleText);
+    this.stopSpeech();
+    return this.speakViaBackend(clean).then((ok) => {
+      if (!ok) {
+        this._speakViaBrowser(clean);
+      }
+      return true;
+    });
+  }
+
+  /** Configure backend TTS provider ('auto'|'edge'|'openai'|'elevenlabs'|'pyttsx3'|'system'|'browser') */
   public setTtsProvider(provider: string) {
     this.ttsProvider = provider;
     this.backendTtsAvailable = null; // reset probe cache on provider change
+    saveVoiceSettings({ ttsProvider: provider as any });
   }
 
   /** Set Edge TTS voice name (e.g. 'en-US-AriaNeural', 'en-GB-SoniaNeural') */
   public setTtsVoice(voice: string | null) {
     this.ttsVoice = voice;
+    if (voice) saveVoiceSettings({ ttsVoice: voice });
   }
 
   /** Set TTS speed (0.5–2.0, 1.0 = normal) */
   public setTtsSpeed(speed: number) {
     this.ttsSpeed = Math.max(0.5, Math.min(2.0, speed));
+    saveVoiceSettings({ ttsSpeed: this.ttsSpeed });
   }
 
   public get ttsCurrentProvider(): string { return this.ttsProvider; }
   public get ttsCurrentVoice(): string | null { return this.ttsVoice; }
+
+  private startBargeInMonitor() {
+    if (!this.bargeInEnabled || this.bargeInMonitorActive) return;
+    this.bargeInMonitorActive = true;
+    let speechCounter = 0;
+
+    const monitorTick = () => {
+      if (!this.isSpeaking || !this.bargeInMonitorActive) {
+        this.bargeInMonitorActive = false;
+        return;
+      }
+
+      if (this.analyser) {
+        const pcmData = new Uint8Array(this.analyser.fftSize);
+        this.analyser.getByteTimeDomainData(pcmData);
+        let sum = 0;
+        for (let i = 0; i < pcmData.length; i++) {
+          const centered = pcmData[i] - 128;
+          sum += centered * centered;
+        }
+        const rms = Math.sqrt(sum / pcmData.length);
+        const normalized = Math.min(1, rms / 42);
+
+        // Hermes barge-in threshold during playback (>= 0.12)
+        if (normalized >= 0.12) {
+          speechCounter++;
+          if (speechCounter >= 8) { // sustained user speech detected -> interrupt!
+            this.bargeInMonitorActive = false;
+            this.stopSpeech();
+            if (this.isContinuousMode) {
+              void this.start(true);
+            }
+            return;
+          }
+        } else {
+          speechCounter = Math.max(0, speechCounter - 1);
+        }
+      }
+
+      this.bargeInAnimId = requestAnimationFrame(monitorTick);
+    };
+
+    this.bargeInAnimId = requestAnimationFrame(monitorTick);
+  }
+
+  private stopBargeInMonitor() {
+    this.bargeInMonitorActive = false;
+    if (this.bargeInAnimId) {
+      cancelAnimationFrame(this.bargeInAnimId);
+      this.bargeInAnimId = null;
+    }
+  }
 
   /**
    * Backend TTS via /api/voice/tts (Edge TTS / OpenAI / ElevenLabs / pyttsx3 / OS)
@@ -1051,6 +1198,7 @@ export class VoiceEngine {
 
   /** Called when TTS audio finishes (backend or browser) — re-arms continuous mode */
   private _onTtsDone() {
+    this.stopBargeInMonitor();
     this.isSpeaking = false;
     this.currentUtterance = null;
     if (this.ttsQueue.length > 0) {
@@ -1089,6 +1237,7 @@ export class VoiceEngine {
 
     this.isSpeaking = true;
     this.setState("speaking");
+    this.startBargeInMonitor();
 
     // Try backend TTS first (unless provider is explicitly 'browser')
     if (this.ttsProvider !== "browser" && typeof window !== "undefined" && window.fetch) {
@@ -1149,6 +1298,7 @@ export class VoiceEngine {
   }
 
   public stopSpeech() {
+    this.stopBargeInMonitor();
     this.ttsQueue = [];
 
     // Stop HTMLAudioElement (backend TTS)

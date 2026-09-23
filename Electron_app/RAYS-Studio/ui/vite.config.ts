@@ -399,7 +399,7 @@ export default defineConfig(({ mode }) => ({
 
           req.on("end", async () => {
             try {
-              const { audioBase64, mimeType } = JSON.parse(body || "{}");
+              const { audioBase64, mimeType, provider } = JSON.parse(body || "{}");
               const isWin = process.platform === "win32";
 
               // Cross-platform Python resolver
@@ -467,8 +467,9 @@ try:
     raw = sys.stdin.buffer.read()
     data = raw.decode("utf-8", errors="ignore").strip()
     m_type = sys.argv[1] if len(sys.argv) > 1 else "audio/webm"
+    p_provider = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "" else None
     from rays_core.voice_transcriber import transcribe_audio_base64
-    res = transcribe_audio_base64(data, m_type)
+    res = transcribe_audio_base64(data, m_type, provider=p_provider)
 except Exception as e:
     import traceback
     res = {"success": False, "transcript": "", "error": str(e), "traceback": traceback.format_exc()}
@@ -476,7 +477,7 @@ except Exception as e:
 print("JSON_START" + json.dumps(res) + "JSON_END")
 `;
 
-              const proc = spawn(selectedPython, ["-c", pythonScript, mimeType || "audio/webm"], {
+              const proc = spawn(selectedPython, ["-c", pythonScript, mimeType || "audio/webm", provider || ""], {
                 env: {
                   ...process.env,
                   PATH: envPath,
