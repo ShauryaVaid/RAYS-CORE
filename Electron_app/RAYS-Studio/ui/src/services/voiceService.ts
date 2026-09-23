@@ -552,13 +552,21 @@ export class VoiceEngine {
       this.setState("thinking");
       this.emitFinalUtterance(cleanPrompt || finalUtterance);
 
-      // In continuous mode, if not speaking TTS, automatically re-arm listening for next turn
+      // In continuous mode, re-arm listening for the next turn after TTS finishes
+      // Use 1200ms delay to let TTS begin before we check isSpeaking state
       if (this.isContinuousMode) {
         setTimeout(() => {
-          if (this.isContinuousMode && !this.isSpeaking && this.state !== "recording" && this.state !== "listening") {
+          // Only re-arm if TTS hasn't started (drainTtsQueue handles re-arm after speech ends)
+          if (
+            this.isContinuousMode &&
+            !this.isSpeaking &&
+            this.state !== "recording" &&
+            this.state !== "listening" &&
+            this.state !== "speaking"
+          ) {
             void this.start(true);
           }
-        }, 800);
+        }, 1200);
       }
     } else if (this.isContinuousMode) {
       // Empty turn -> re-arm listening
@@ -603,7 +611,7 @@ export class VoiceEngine {
     })();
 
     const timeoutPromise = new Promise<string>((resolve) => {
-      setTimeout(() => resolve(""), 3500);
+      setTimeout(() => resolve(""), 8000);
     });
 
     return Promise.race([fetchPromise, timeoutPromise]);
@@ -986,15 +994,21 @@ export class VoiceEngine {
     utterance.pitch = 1.0;
 
     const voices = window.speechSynthesis.getVoices();
-    const preferredVoice = voices.find(
-      (v) =>
-        (v.name.includes("Samantha") ||
-          v.name.includes("Natural") ||
-          v.name.includes("Google") ||
-          v.name.includes("Daniel") ||
-          v.name.includes("English")) &&
-        v.lang.startsWith("en")
-    );
+    // Priority order: high-quality voices first, broad English fallback for any OS
+    // macOS: Samantha, Alex, Daniel | Windows: Zira, Hazel, David | Linux: any en voice
+    const preferredVoice =
+      voices.find((v) => v.name === "Samantha" && v.lang.startsWith("en")) ||       // macOS best
+      voices.find((v) => v.name === "Alex" && v.lang.startsWith("en")) ||            // macOS alt
+      voices.find((v) => v.name.includes("Zira") && v.lang.startsWith("en")) ||     // Windows female
+      voices.find((v) => v.name.includes("Hazel") && v.lang.startsWith("en")) ||    // Windows alt
+      voices.find((v) => v.name.includes("David") && v.lang.startsWith("en")) ||    // Windows male
+      voices.find((v) => v.name.includes("Daniel") && v.lang.startsWith("en")) ||   // macOS/iOS
+      voices.find((v) => v.name.includes("Google") && v.lang.startsWith("en")) ||   // Chrome
+      voices.find((v) => v.name.includes("Natural") && v.lang.startsWith("en")) ||  // Neural voices
+      voices.find((v) => v.name.includes("English") && v.lang.startsWith("en")) ||  // Generic en
+      voices.find((v) => v.lang === "en-US") ||                                      // Any en-US
+      voices.find((v) => v.lang.startsWith("en")) ||                                 // Any English
+      voices[0] || null;                                                              // Ultimate fallback
     if (preferredVoice) {
       utterance.voice = preferredVoice;
     }
