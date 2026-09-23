@@ -484,7 +484,9 @@ def main():
     setup = render_setup_sh(plan, brief, team)
 
     Path(args.out).write_text(setup)
-    os.chmod(args.out, 0o755)
+    if sys.platform != "win32":
+
+        os.chmod(args.out, 0o755)
     print(f"Wrote {args.out}")
 
     if args.brief_out:

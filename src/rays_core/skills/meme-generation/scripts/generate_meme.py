@@ -173,13 +173,21 @@ def get_template_image(url: str) -> Image.Image:
 def find_font(size: int) -> ImageFont.FreeTypeFont:
     """Find a bold font for meme text. Tries Impact, then falls back."""
     candidates = [
+        # Windows
+        "C:/Windows/Fonts/impact.ttf",
+        "C:/Windows/Fonts/Impact.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/DejaVuSans-Bold.ttf",
+        # macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFCompact.ttf",
+        "/Library/Fonts/Impact.ttf",
+        # Linux
         "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
         "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/dejavu-sans/DejaVuSans-Bold.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFCompact.ttf",
     ]
     for path in candidates:
         if os.path.exists(path):

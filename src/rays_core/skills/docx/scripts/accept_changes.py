@@ -1,3 +1,5 @@
+import os
+import tempfile
 """Accept all tracked changes in a DOCX file using LibreOffice.
 
 Requires LibreOffice (soffice) to be installed.
@@ -13,7 +15,7 @@ from office.soffice import get_soffice_env
 
 logger = logging.getLogger(__name__)
 
-LIBREOFFICE_PROFILE = "/tmp/libreoffice_docx_profile"
+LIBREOFFICE_PROFILE = os.path.join(tempfile.gettempdir(), "libreoffice_docx_profile")
 MACRO_DIR = f"{LIBREOFFICE_PROFILE}/user/basic/Standard"
 
 ACCEPT_CHANGES_MACRO = """<?xml version="1.0" encoding="UTF-8"?>

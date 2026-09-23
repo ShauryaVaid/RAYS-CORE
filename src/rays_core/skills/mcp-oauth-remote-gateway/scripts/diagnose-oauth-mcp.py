@@ -1,3 +1,4 @@
+import sys
 #!/usr/bin/env python3
 """Diagnose an OAuth-gated remote MCP server's connection state.
 
@@ -160,7 +161,9 @@ def main():
                 new["refresh_token"] = j["refresh_token"]
             tmp = tpath + ".tmp"
             open(tmp, "w").write(json.dumps(new, indent=2))
-            os.chmod(tmp, 0o600)
+            if sys.platform != "win32":
+
+                os.chmod(tmp, 0o600)
             os.replace(tmp, tpath)
             print(f"     wrote {tpath} (0600). NOW RESTART the gateway to clear the breaker.")
         print("BRANCH=REFRESH_FIXED  -> refreshed token works. Persist (--write) + restart gateway.")

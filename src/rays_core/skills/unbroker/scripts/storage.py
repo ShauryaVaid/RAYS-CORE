@@ -1,3 +1,4 @@
+import sys
 """Storage helpers (stdlib only): atomic JSON, append-only JSONL, strict perms.
 
 Default backend is local-json. The optional google-sheets tracker is handled in
@@ -57,7 +58,9 @@ def locked(target: Path, timeout: float = 10.0, stale: float = 30.0):
 
 def _secure(path: Path, mode: int) -> None:
     try:
-        os.chmod(path, mode)
+        if sys.platform != "win32":
+
+            os.chmod(path, mode)
     except OSError:
         pass  # non-POSIX / unsupported FS; RAYS_HOME directory perms still apply
 
