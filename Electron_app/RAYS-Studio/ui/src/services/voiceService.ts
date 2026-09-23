@@ -991,19 +991,33 @@ export class VoiceEngine {
     if (this.ttsProvider === "browser") return false;
 
     try {
-      const body: Record<string, unknown> = { text, speed: this.ttsSpeed };
-      if (this.ttsProvider !== "auto") body.provider = this.ttsProvider;
-      if (this.ttsVoice) body.voice = this.ttsVoice;
+      let data: any;
 
-      const res = await fetch("/api/voice/tts", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout ? AbortSignal.timeout(32000) : undefined,
-      });
+      if ((window as any).raysDesktop?.synthesizeSpeech) {
+        // Use Electron IPC
+        data = await (window as any).raysDesktop.synthesizeSpeech(
+          text,
+          this.ttsProvider !== "auto" ? this.ttsProvider : undefined,
+          this.ttsVoice || undefined,
+          this.ttsSpeed
+        );
+      } else {
+        // Use Vite Proxy
+        const body: Record<string, unknown> = { text, speed: this.ttsSpeed };
+        if (this.ttsProvider !== "auto") body.provider = this.ttsProvider;
+        if (this.ttsVoice) body.voice = this.ttsVoice;
 
-      if (!res.ok) return false;
-      const data = await res.json();
+        const res = await fetch("/api/voice/tts", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout ? AbortSignal.timeout(32000) : undefined,
+        });
+
+        if (!res.ok) return false;
+        data = await res.json();
+      }
+
       if (!data?.success || !data.audioBase64) return false;
 
       // Mark backend as available

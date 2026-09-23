@@ -1083,18 +1083,42 @@ print("JSON_START" + json.dumps(out) + "JSON_END")
 
 function getPythonRuntime(workspaceRoot = null) {
   const isWin = process.platform === "win32";
+
+  // Cross-platform Python resolver
   const pythonCandidates = [
-    process.env.PYTHON,
-    "/opt/anaconda3/bin/python3",
-    "/opt/homebrew/bin/python3",
-    "/usr/local/bin/python3",
-    "python3",
+    process.env.PYTHON || "",
+    process.env.PYTHON3 || "",
+    ...(isWin ? [
+      "python.exe",
+      path.join(process.env.LOCALAPPDATA || "", "Programs", "Python", "Python312", "python.exe"),
+      path.join(process.env.LOCALAPPDATA || "", "Programs", "Python", "Python311", "python.exe"),
+      path.join(os.homedir(), "AppData", "Local", "Programs", "Python", "Python312", "python.exe"),
+      "python",
+    ] : []),
+    ...(!isWin && process.platform === "darwin" ? [
+      "/opt/homebrew/bin/python3",
+      "/opt/anaconda3/bin/python3",
+      "/usr/local/bin/python3",
+      "python3",
+    ] : []),
+    ...(!isWin && process.platform === "linux" ? [
+      "/usr/bin/python3",
+      "/usr/local/bin/python3",
+      "/usr/bin/python",
+      "python3",
+    ] : []),
     "python",
   ].filter(Boolean);
 
   let selectedPython = isWin ? "python" : "python3";
   for (const c of pythonCandidates) {
-    if (fs.existsSync(c)) {
+    if (!c) continue;
+    if (c.includes("/") || c.includes("\\") || c.includes(".exe")) {
+      if (fs.existsSync(c)) {
+        selectedPython = c;
+        break;
+      }
+    } else {
       selectedPython = c;
       break;
     }
@@ -1115,10 +1139,24 @@ function getPythonRuntime(workspaceRoot = null) {
   const projectRoot = path.resolve(__dirname, "../../..");
   const srcPath = path.join(projectRoot, "src");
 
+  const extraPaths = isWin
+    ? []
+    : process.platform === "darwin"
+      ? ["/opt/homebrew/bin", "/opt/anaconda3/bin", "/usr/local/bin", "/usr/bin"]
+      : ["/usr/bin", "/usr/local/bin"];
+
+  const envPath = [
+    ...extraPaths,
+    process.env.PATH || "",
+  ].filter(Boolean).join(isWin ? ";" : ":");
+
+  const pyPathSep = isWin ? ";" : ":";
+
   const env = {
     ...process.env,
-    PATH: `/opt/anaconda3/bin:/opt/homebrew/bin:/usr/local/bin:${process.env.PATH || ""}`,
-    PYTHONPATH: `${srcPath}:${workspaceRoot || ""}:${process.env.PYTHONPATH || ""}`,
+    PATH: envPath,
+    PYTHONPATH: `${srcPath}${pyPathSep}${workspaceRoot || ""}${pyPathSep}${process.env.PYTHONPATH || ""}`,
+    PYTHONUTF8: "1",
   };
 
   return { pythonPath: selectedPython, env, projectRoot, srcPath };
@@ -1172,5 +1210,97 @@ print("JSON_START" + json.dumps(res) + "JSON_END")
 
     proc.stdin.write(audioBase64 || "");
     proc.stdin.end();
+  });
+});
+
+ipcMain.handle("rays:synthesize-speech", async (_event, { text, provider, voice, speed }) => {
+  const { pythonPath, env, srcPath } = getPythonRuntime();
+
+  const pythonScript = `
+import sys, json, traceback
+sys.path.insert(0, ${JSON.stringify(srcPath)})
+try:
+    data = sys.stdin.buffer.read().decode("utf-8").strip()
+    params = json.loads(data) if data else {}
+    from rays_core.voice_tts import synthesize_speech
+    res = synthesize_speech(
+        params.get("text", ""),
+        provider=params.get("provider"),
+        voice=params.get("voice"),
+        speed=float(params.get("speed", 1.0)),
+    )
+except Exception as e:
+    res = {"success": False, "audioBase64": "", "mimeType": "audio/mpeg", "provider": "", "error": str(e), "traceback": traceback.format_exc()}
+print("JSON_START" + json.dumps(res) + "JSON_END")
+`;
+
+  return await new Promise((resolve) => {
+    const proc = spawn(pythonPath, ["-c", pythonScript], {
+      env,
+      cwd: os.homedir(),
+    });
+
+    let output = "";
+    proc.stdout.on("data", (d) => { output += d.toString("utf8"); });
+    proc.stderr.on("data", (d) => { console.warn("[Electron TTS]", d.toString("utf8").trim()); });
+
+    let closed = false;
+    const timer = setTimeout(() => {
+      if (!closed) {
+        closed = true;
+        try { proc.kill(); } catch {}
+        resolve({ success: false, audioBase64: "", error: "TTS timeout (30s)" });
+      }
+    }, 30000);
+
+    proc.on("error", (err) => {
+      if (closed) return; closed = true; clearTimeout(timer);
+      resolve({ success: false, audioBase64: "", error: \`Python error: \${String(err)}\` });
+    });
+
+    proc.on("close", () => {
+      if (closed) return; closed = true; clearTimeout(timer);
+      const match = output.match(/JSON_START([\s\S]*?)JSON_END/);
+      if (match) {
+        try { resolve(JSON.parse(match[1])); return; } catch {}
+      }
+      resolve({ success: false, audioBase64: "", error: output || "TTS failed" });
+    });
+
+    try {
+      proc.stdin.write(JSON.stringify({ text, provider, voice, speed }));
+      proc.stdin.end();
+    } catch { /* ignore EPIPE */ }
+  });
+});
+
+ipcMain.handle("rays:list-voices", async () => {
+  const { pythonPath, env, srcPath } = getPythonRuntime();
+
+  const pythonScript = `
+import sys, json
+sys.path.insert(0, ${JSON.stringify(srcPath)})
+try:
+    from rays_core.voice_tts import list_edge_voices
+    res = list_edge_voices()
+except Exception as e:
+    res = {"success": False, "voices": [], "error": str(e)}
+print("JSON_START" + json.dumps(res) + "JSON_END")
+`;
+
+  return await new Promise((resolve) => {
+    const proc = spawn(pythonPath, ["-c", pythonScript], { env, cwd: os.homedir() });
+    let output = "";
+    proc.stdout.on("data", (d) => { output += d.toString("utf8"); });
+    proc.stderr.on("data", (d) => { console.warn("[Electron Voices]", d.toString("utf8").trim()); });
+    
+    proc.on("close", () => {
+      const match = output.match(/JSON_START([\s\S]*?)JSON_END/);
+      if (match) {
+        try { resolve(JSON.parse(match[1])); return; } catch {}
+      }
+      resolve({ success: false, voices: [], error: "Failed" });
+    });
+    proc.on("error", () => resolve({ success: false, voices: [], error: "Python not found" }));
   });
 });
