@@ -34,6 +34,153 @@ export interface VoiceTranscriptCallback {
 
 export type VoiceState = "idle" | "listening" | "recording" | "transcribing" | "thinking" | "speaking";
 
+// ── Whisper Hallucination Filter (ported from Hermes voice_mode_transcript.py) ──────────
+// Whisper commonly outputs these phrases on silent/near-silent audio.
+const WHISPER_HALLUCINATIONS = new Set([
+  "thank you", "thanks for watching", "subscribe to my channel", "like and subscribe",
+  "please subscribe", "thank you for watching", "bye", "you", "the end",
+  "thanks", "ok", "okay", "hmm", "ah", "oh", "um", "uh",
+  // Non-English hallucinations
+  "sous-titres", "amara.org", "www.mooji.org",
+]);
+const HALLUCINATION_REPEAT_RE = /^(?:thank you|thanks|bye|you|ok|okay|the end|\.|,|!|\s)+$/i;
+
+export function isWhisperHallucination(transcript: string): boolean {
+  const cleaned = transcript.trim().toLowerCase();
+  if (!cleaned) return true;
+  const stripped = cleaned.replace(/[.!]+$/, "");
+  return WHISPER_HALLUCINATIONS.has(stripped) || HALLUCINATION_REPEAT_RE.test(cleaned);
+}
+
+// ── TTS Echo Guard (ported from Hermes voice_mode_transcript.py) ────────────────────────
+// When barge-in fires during TTS, the mic might capture RAYS's own speech.
+// This detects when a transcript is just an echo of what RAYS is saying.
+const TTS_ECHO_SIMILARITY_THRESHOLD = 0.55;
+const MIN_FRAGMENT_LENGTH_FOR_ECHO = 8;
+
+function normalizeForEchoCompare(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function stringSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  if (!a.length || !b.length) return 0;
+  // Simple bigram similarity (Dice coefficient) — fast, language-agnostic
+  const bigramsA = new Set<string>();
+  for (let i = 0; i < a.length - 1; i++) bigramsA.add(a.substring(i, i + 2));
+  const bigramsB = new Set<string>();
+  for (let i = 0; i < b.length - 1; i++) bigramsB.add(b.substring(i, i + 2));
+  let intersection = 0;
+  for (const bg of bigramsA) if (bigramsB.has(bg)) intersection++;
+  return (2 * intersection) / (bigramsA.size + bigramsB.size);
+}
+
+export function isTtsEcho(transcript: string, spokenText: string): boolean {
+  const a = normalizeForEchoCompare(transcript || "");
+  const b = normalizeForEchoCompare(spokenText || "");
+  if (!a || !b) return false;
+  if (stringSimilarity(a, b) >= TTS_ECHO_SIMILARITY_THRESHOLD) return true;
+  // Sliding window for fragments (mic captures a portion of the TTS output)
+  if (a.length < MIN_FRAGMENT_LENGTH_FOR_ECHO || a.length >= b.length) return false;
+  for (let start = 0; start <= b.length - a.length; start++) {
+    if (stringSimilarity(a, b.substring(start, start + a.length)) >= TTS_ECHO_SIMILARITY_THRESHOLD) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ── Thinking Chime Generator (Hermes plays a tone while agent processes) ────────────────
+function playThinkingChime(): void {
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const now = ctx.currentTime;
+    // Two-tone ascending chime: gentle notification that RAYS is thinking
+    [440, 554].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, now + i * 0.12);
+      gain.gain.setValueAtTime(0, now + i * 0.12);
+      gain.gain.linearRampToValueAtTime(0.08, now + i * 0.12 + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.12 + 0.25);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(now + i * 0.12);
+      osc.stop(now + i * 0.12 + 0.3);
+    });
+    setTimeout(() => ctx.close().catch(() => {}), 800);
+  } catch { /* AudioContext unavailable — silent fallback */ }
+}
+
+// ── Advanced TTS Text Normalizer (ported from Hermes tts_text_normalize.py) ─────────────
+function prepareSpokeText(raw: string): string {
+  if (!raw) return "";
+  let text = raw;
+  // Strip <think>...</think> reasoning blocks (models with reasoning enabled)
+  text = text.replace(/<think[\s>].*?<\/think>/gis, " ");
+  text = text.replace(/<think[\s>].*$/gis, " ");  // Unterminated block
+  // Strip code blocks
+  text = text.replace(/```[\s\S]*?```/g, " Code block omitted. ");
+  // Strip images, keep alt text
+  text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_, alt) => alt ? ` ${alt} ` : " ");
+  // Links: keep label, drop URL
+  text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  // Strip bare URLs
+  text = text.replace(/https?:\/\/\S+/g, "");
+  // Inline code: keep content
+  text = text.replace(/`([^`]+)`/g, "$1");
+  // Bold / italic / strikethrough
+  text = text.replace(/\*\*(.+?)\*\*/gs, "$1");
+  text = text.replace(/__(.+?)__/gs, "$1");
+  text = text.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/gs, "$1");
+  text = text.replace(/(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/gs, "$1");
+  text = text.replace(/~~(.+?)~~/gs, "$1");
+  // Headings → plain text with comma lead-in
+  text = text.replace(/^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm, "$1,");
+  // Blockquotes
+  text = text.replace(/^\s*>\s?/gm, "");
+  // List markers
+  text = text.replace(/^\s*(?:[-*+]|\d+[.)])\s+/gm, "");
+  // Horizontal rules
+  text = text.replace(/^\s*[-*_]{3,}\s*$/gm, "");
+  // Table pipes → pause
+  text = text.replace(/\s*\|\s*/g, "; ");
+  // Degree symbols → words
+  text = text.replace(/(\d+)\s*°\s*C\b/gi, "$1 degrees Celsius");
+  text = text.replace(/(\d+)\s*°\s*F\b/gi, "$1 degrees Fahrenheit");
+  text = text.replace(/(\d+)\s*°/g, "$1 degrees");
+  // Common units
+  text = text.replace(/(?<=\d)\s*km\s*\/\s*h\b/gi, " kilometres per hour");
+  text = text.replace(/(?<=\d)\s*mm\b/g, " millimetres");
+  text = text.replace(/(?<=\d)\s*cm\b/g, " centimetres");
+  // Currency
+  text = text.replace(/\$\s*([\d,]*\d(?:\.\d+)?)/g, "$1 dollars");
+  text = text.replace(/€\s*([\d,]*\d(?:\.\d+)?)/g, "$1 euros");
+  text = text.replace(/£\s*([\d,]*\d(?:\.\d+)?)/g, "$1 pounds");
+  // Percentage
+  text = text.replace(/(?<=\d)\s*%/g, " percent");
+  // Symbols
+  text = text.replace(/&/g, " and ");
+  text = text.replace(/→/g, " to ");
+  text = text.replace(/⇒/g, " to ");
+  text = text.replace(/≈/g, " about ");
+  text = text.replace(/~/g, " about ");
+  // Emojis (broad unicode ranges)
+  text = text.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}]/gu, "");
+  // Collapse whitespace
+  text = text.replace(/\n{3,}/g, "\n\n");
+  text = text.replace(/[ \t]{2,}/g, " ");
+  text = text.replace(/\s+([,.;:!?])/g, "$1");
+  // Flatten newlines for TTS
+  text = text.replace(/\n{2,}/g, ". ");
+  text = text.replace(/(?<=[.!?;:,])\n/g, " ");
+  text = text.replace(/\n/g, ". ");
+  text = text.replace(/\.\s*\./g, ".");
+  // Length cap
+  if (text.length > 4000) text = text.substring(0, 4000).trimEnd();
+  return text.trim();
+}
+
 const STOP_PHRASES: readonly string[] = [
   "stop",
   "stop listening",
@@ -205,6 +352,12 @@ export class VoiceEngine {
   private bargeInEnabled: boolean = true;
   private bargeInMonitorActive = false;
   private bargeInAnimId: number | null = null;
+
+  // TTS Echo Guard: tracks what RAYS is currently speaking to filter self-captures
+  private lastSpokenText: string = "";
+
+  // Thinking chime: plays a gentle tone when processing user speech
+  private thinkingChimeEnabled: boolean = true;
 
   public state: VoiceState = "idle";
   public onStateChange?: (state: VoiceState) => void;
@@ -559,6 +712,20 @@ export class VoiceEngine {
     this.silenceStartedAt = null;
     this.turnClosing = false;
 
+    // ── Whisper Hallucination Filter (Hermes parity) ──
+    // Silent audio often produces "thank you", "thanks for watching", etc.
+    if (isWhisperHallucination(finalUtterance)) {
+      if (this.isContinuousMode) void this.start(true);
+      return;
+    }
+
+    // ── TTS Echo Guard (Hermes parity) ──
+    // If barge-in caught RAYS's own TTS output replayed through the mic, ignore it
+    if (this.lastSpokenText && isTtsEcho(finalUtterance, this.lastSpokenText)) {
+      if (this.isContinuousMode) void this.start(true);
+      return;
+    }
+
     // Check stop word
     if (isVoiceStopCommand(finalUtterance)) {
       this.emitStopWord();
@@ -571,6 +738,9 @@ export class VoiceEngine {
       const cleanPrompt = finalUtterance
         .replace(/^(hey\s*rays?|hey\s*ray|hey\s*raze|hey\s*raise|hey\s*race|hey\s*raz[eo]r|hey\s*google|ok\s*google|okay\s*google|google|hey\s*waz[ey]s?|waz[ey]s?|hey\s*hermes|ok\s*rays?|rays?|rais|raise|hermes|siri|alexa)[,\s]*/i, "")
         .trim();
+
+      // ── Thinking Chime (Hermes parity) ──
+      if (this.thinkingChimeEnabled) playThinkingChime();
 
       this.setState("thinking");
       this.emitFinalUtterance(cleanPrompt || finalUtterance);
@@ -1213,12 +1383,17 @@ export class VoiceEngine {
 
   /**
    * Speak text aloud.
+   * Uses Hermes-level text normalization (strips markdown, code blocks, <think> blocks,
+   * converts symbols/units/currency to words, strips emojis).
    * Priority: Backend TTS (Edge/OpenAI/ElevenLabs/pyttsx3) → Web Speech Synthesis fallback.
    * In continuous mode, re-arms listening automatically when done (Hermes style).
    */
   public speak(text: string) {
-    const clean = this.sanitizeForSpeech(text);
+    const clean = prepareSpokeText(text);
     if (!clean) return;
+
+    // Track for TTS echo guard — barge-in will compare captured audio against this
+    this.lastSpokenText = clean;
 
     this.ttsQueue.push(clean);
     if (!this.isSpeaking) {
@@ -1322,15 +1497,9 @@ export class VoiceEngine {
     }
   }
 
+  /** @deprecated Use prepareSpokeText() instead — kept for backward compat */
   private sanitizeForSpeech(raw: string): string {
-    return raw
-      .replace(/```[\s\S]*?```/g, "Code block omitted.")
-      .replace(/`([^`]+)`/g, "$1")
-      .replace(/https?:\/\/\S+/g, "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/[*_#~>|]/g, "")
-      .replace(/\n+/g, " ")
-      .trim();
+    return prepareSpokeText(raw);
   }
 }
 
