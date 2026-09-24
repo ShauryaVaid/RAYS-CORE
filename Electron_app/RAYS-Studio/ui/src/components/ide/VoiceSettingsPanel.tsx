@@ -139,10 +139,16 @@ export function VoiceSettingsPanel() {
         }
         if (!cancelled && data?.voices?.length) {
           setVoices(
-            data.voices.map((v: any) => ({
-              id: v.ShortName || v.id || v,
-              label: `${v.ShortName || v.id || v} (${v.Gender || ""} ${v.Locale || ""})`.trim(),
-            }))
+            data.voices.map((v: any) => {
+              // Python backend returns {name, gender, locale}; raw edge-tts returns {ShortName, Gender, Locale}
+              const id = v.name || v.ShortName || v.id || (typeof v === "string" ? v : "");
+              const gender = v.gender || v.Gender || "";
+              const locale = v.locale || v.Locale || "";
+              return {
+                id,
+                label: `${id} (${gender} ${locale})`.trim(),
+              };
+            })
           );
         }
       } catch {
