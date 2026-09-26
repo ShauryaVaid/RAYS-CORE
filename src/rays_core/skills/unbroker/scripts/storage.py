@@ -1,4 +1,3 @@
-import sys
 """Storage helpers (stdlib only): atomic JSON, append-only JSONL, strict perms.
 
 Default backend is local-json. The optional google-sheets tracker is handled in
@@ -6,6 +5,8 @@ report.py by emitting rows for the `google-workspace` skill; this module stays
 dependency-free so the hermetic tests never touch the network.
 """
 from __future__ import annotations
+
+import sys
 
 import contextlib
 import json
